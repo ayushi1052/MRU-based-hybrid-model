@@ -3,11 +3,11 @@ import argparse
 import datetime
 import json
 import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
-from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 from torchvision.utils import make_grid
@@ -18,68 +18,113 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 # ===============================
-# MRU BLOCK
+# FILM — Feature-wise Linear Modulation
 # ===============================
-class LightMRU(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class FiLM(nn.Module):
+    """
+    Projects a class embedding into per-channel scale (γ) and shift (β),
+    then applies: output = γ * x + β
+    (γ, β) are broadcast over the spatial dimensions of x.
+    """
+    def __init__(self, embed_dim, num_features):
+        super().__init__()
+        self.linear = nn.Linear(embed_dim, num_features * 2)
+
+    def forward(self, x, embed):
+        # embed: (b, embed_dim)
+        gamma, beta = self.linear(embed).chunk(2, dim=1)   # each (b, num_features)
+        gamma = gamma[:, :, None, None]                     # (b, c, 1, 1)
+        beta  = beta[:, :, None, None]
+        return gamma * x + beta
+
+
+# ===============================
+# CONDITIONAL MRU BLOCK
+# ===============================
+class CondLightMRU(nn.Module):
+    """
+    MRU selective fusion followed by FiLM class conditioning:
+      1. MRU: out = sigmoid(mask(x)) * feat(x) + (1 - sigmoid(mask(x))) * skip(x)
+      2. FiLM: out = γ(embed) * out + β(embed)
+    """
+    def __init__(self, in_ch, out_ch, embed_dim):
         super().__init__()
         self.mask = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.feat = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.skip = nn.Conv2d(in_ch, out_ch, 1)
+        self.film = FiLM(embed_dim, out_ch)
 
-    def forward(self, x):
-        m = torch.sigmoid(self.mask(x))
-        fx = self.feat(x)
-        x_skip = self.skip(x)
-        return m * fx + (1 - m) * x_skip
+    def forward(self, x, embed):
+        m   = torch.sigmoid(self.mask(x))
+        out = m * self.feat(x) + (1 - m) * self.skip(x)   # MRU selective fusion
+        return self.film(out, embed)                        # FiLM modulation
 
 
 # ===============================
-# GENERATOR
+# CONDITIONAL GENERATOR — MRU U-Net
 # ===============================
-class Generator(nn.Module):
-    def __init__(self):
+class CondGenerator(nn.Module):
+    """
+    U-Net generator with MRU blocks.
+    The class label is embedded and injected into every Cond MRU block via FiLM.
+    """
+    def __init__(self, num_classes, embed_dim=64):
         super().__init__()
-        self.pool = nn.MaxPool2d(2)
+        self.class_embed = nn.Embedding(num_classes, embed_dim)
+        self.pool        = nn.MaxPool2d(2)
 
-        self.e1 = LightMRU(3, 16)
-        self.e2 = LightMRU(16, 32)
-        self.e3 = LightMRU(32, 64)
+        # Encoder
+        self.e1 = CondLightMRU(3,   16,  embed_dim)
+        self.e2 = CondLightMRU(16,  32,  embed_dim)
+        self.e3 = CondLightMRU(32,  64,  embed_dim)
 
-        self.b = LightMRU(64, 128)
+        # Bottleneck
+        self.b  = CondLightMRU(64,  128, embed_dim)
 
+        # Decoder  (in_ch = upsample_ch + skip_ch)
         self.up1 = nn.ConvTranspose2d(128, 64, 2, 2)
-        self.d1 = LightMRU(128, 64)
+        self.d1  = CondLightMRU(128, 64,  embed_dim)   # 64 (up) + 64 (skip E3)
 
-        self.up2 = nn.ConvTranspose2d(64, 32, 2, 2)
-        self.d2 = LightMRU(64, 32)
+        self.up2 = nn.ConvTranspose2d(64,  32, 2, 2)
+        self.d2  = CondLightMRU(64,  32,  embed_dim)   # 32 (up) + 32 (skip E2)
 
-        self.up3 = nn.ConvTranspose2d(32, 16, 2, 2)
-        self.d3 = LightMRU(32, 16)
+        self.up3 = nn.ConvTranspose2d(32,  16, 2, 2)
+        self.d3  = CondLightMRU(32,  16,  embed_dim)   # 16 (up) + 16 (skip E1)
 
         self.out = nn.Conv2d(16, 3, 1)
 
-    def forward(self, x):
-        s1 = self.e1(x)
-        s2 = self.e2(self.pool(s1))
-        s3 = self.e3(self.pool(s2))
+    def forward(self, x, label):
+        embed = self.class_embed(label)                         # (b, embed_dim)
 
-        b = self.b(self.pool(s3))
+        # Encoder
+        s1 = self.e1(x,             embed)
+        s2 = self.e2(self.pool(s1), embed)
+        s3 = self.e3(self.pool(s2), embed)
 
-        d1 = self.d1(torch.cat([self.up1(b),  s3], dim=1))
-        d2 = self.d2(torch.cat([self.up2(d1), s2], dim=1))
-        d3 = self.d3(torch.cat([self.up3(d2), s1], dim=1))
+        # Bottleneck
+        b  = self.b(self.pool(s3),  embed)
+
+        # Decoder with skip connections
+        d1 = self.d1(torch.cat([self.up1(b),  s3], dim=1), embed)
+        d2 = self.d2(torch.cat([self.up2(d1), s2], dim=1), embed)
+        d3 = self.d3(torch.cat([self.up3(d2), s1], dim=1), embed)
 
         return torch.tanh(self.out(d3))
 
 
 # ===============================
-# DISCRIMINATOR
+# CONDITIONAL DISCRIMINATOR — PatchGAN + Projection
 # ===============================
-class Discriminator(nn.Module):
-    def __init__(self):
+class CondDiscriminator(nn.Module):
+    """
+    PatchGAN discriminator with projection conditioning.
+    The class embedding is projected to a scalar bias and added to the patch output:
+      score = patch_features(sketch ‖ image) + Linear(embed)
+    This lets the discriminator ask "does this image look like class C?" per patch.
+    """
+    def __init__(self, num_classes, embed_dim=64):
         super().__init__()
-        self.model = nn.Sequential(
+        self.features = nn.Sequential(
             nn.Conv2d(6, 16, 4, 2, 1),
             nn.LeakyReLU(0.2),
 
@@ -91,17 +136,31 @@ class Discriminator(nn.Module):
             nn.InstanceNorm2d(64),
             nn.LeakyReLU(0.2),
 
-            nn.Conv2d(64, 1, 4, 1, 1)
+            nn.Conv2d(64, 1, 4, 1, 1)                         # (b, 1, h', w')
         )
+        # Projection: class embed → scalar bias added to every patch
+        self.class_embed = nn.Embedding(num_classes, embed_dim)
+        self.proj        = nn.Linear(embed_dim, 1)
 
-    def forward(self, x, y):
-        return self.model(torch.cat([x, y], dim=1))
+    def forward(self, x, y, label):
+        feat = self.features(torch.cat([x, y], dim=1))         # (b, 1, h', w')
+        bias = self.proj(self.class_embed(label))               # (b, 1)
+        bias = bias[:, :, None, None]                           # (b, 1, 1, 1) → broadcast
+        return feat + bias
 
 
 # ===============================
 # DATASET
 # ===============================
 class MRUDataset(Dataset):
+    """
+    Expects data_root with two subdirectories:
+        photo/  <class_name>/  *.jpg
+        sketch/ <class_name>/  *.png
+
+    The class label is derived from the parent folder name.
+    Sketchy dataset structure works out of the box.
+    """
     def __init__(self, root, size=128):
         self.root = Path(root)
         self.transform = T.Compose([
@@ -113,24 +172,38 @@ class MRUDataset(Dataset):
         def normalize(p):
             return p.stem.replace('-1', '').replace('_1', '')
 
-        photos   = {normalize(f): f for f in self.root.glob('photo/**/*.jpg')}
-        sketches = {normalize(f): f for f in self.root.glob('sketch/**/*.png')}
+        # Value: (path, class_name) — class_name = parent folder
+        photos   = {normalize(f): (f, f.parent.name) for f in self.root.glob('photo/**/*.jpg')}
+        sketches = {normalize(f): (f, f.parent.name) for f in self.root.glob('sketch/**/*.png')}
 
         self.keys    = sorted(set(photos) & set(sketches))
         self.photos  = photos
         self.sketches = sketches
-        print(f'[DATASET] Found {len(self.keys)} matched pairs')
+
+        # Build a sorted, stable class index from matched pairs only
+        classes           = sorted({photos[k][1] for k in self.keys})
+        self.class_to_idx = {c: i for i, c in enumerate(classes)}
+        self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
+        self.num_classes  = len(classes)
+
+        print(f'[DATASET] {len(self.keys)} matched pairs across {self.num_classes} classes: {classes}')
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, idx):
         k = self.keys[idx]
-        sketch = Image.open(self.sketches[k]).convert('RGB')
-        photo  = Image.open(self.photos[k]).convert('RGB')
+        sketch_path, class_name = self.sketches[k]
+        photo_path,  _          = self.photos[k]
+
+        sketch = Image.open(sketch_path).convert('RGB')
+        photo  = Image.open(photo_path).convert('RGB')
+        label  = self.class_to_idx[class_name]
+
         return {
             'sketch': self.transform(sketch),
-            'image':  self.transform(photo)
+            'image':  self.transform(photo),
+            'label':  torch.tensor(label, dtype=torch.long)
         }
 
 
@@ -141,17 +214,20 @@ class MRUTrainer:
     def __init__(self, config):
         self.accelerator = Accelerator(mixed_precision=config.mixed_precision, cpu=config.force_cpu)
 
-        self.G = Generator()
-        self.D = Discriminator()
+        # Build dataset first — num_classes comes from the data
+        dataset     = MRUDataset(config.data_root, config.image_size)
+        num_classes = dataset.num_classes
+
+        self.G = CondGenerator(num_classes, embed_dim=config.embed_dim)
+        self.D = CondDiscriminator(num_classes, embed_dim=config.embed_dim)
         self.G.requires_grad_(True)
         self.D.requires_grad_(True)
-
 
         self.criterion_GAN = nn.BCEWithLogitsLoss()
         self.criterion_L1  = nn.L1Loss()
 
         self.dataloader = DataLoader(
-            MRUDataset(config.data_root, config.image_size),
+            dataset,
             batch_size=config.batch_size,
             shuffle=config.shuffle,
             num_workers=config.num_workers
@@ -176,6 +252,7 @@ class MRUTrainer:
         self.best_loss_G = float('inf')
         self.timestamp   = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
         self.config      = config
+        self.config.num_classes = num_classes    # persist for logging
 
     def train(self):
         dataloader_iterator = iter(self.dataloader)
@@ -183,14 +260,15 @@ class MRUTrainer:
 
         for iteration in range(1, self.config.steps + 1):
             batch = next(dataloader_iterator)
-            x = batch['sketch']   # condition (sketch)
-            y = batch['image']    # target (photo)
+            x     = batch['sketch']               # condition  (sketch)
+            y     = batch['image']                # target     (photo)
+            label = batch['label']                # class label
 
             # ---- Train D ----
             with self.accelerator.autocast():
-                fake   = self.G(x)
-                D_real = self.D(x, y)
-                D_fake = self.D(x, fake.detach())
+                fake   = self.G(x, label)
+                D_real = self.D(x, y,             label)
+                D_fake = self.D(x, fake.detach(), label)
                 loss_D = (
                     self.criterion_GAN(D_real, torch.ones_like(D_real)) +
                     self.criterion_GAN(D_fake, torch.zeros_like(D_fake))
@@ -202,8 +280,8 @@ class MRUTrainer:
 
             # ---- Train G ----
             with self.accelerator.autocast():
-                fake   = self.G(x)
-                D_fake = self.D(x, fake)
+                fake   = self.G(x, label)
+                D_fake = self.D(x, fake, label)
                 loss_G = (
                     self.criterion_GAN(D_fake, torch.ones_like(D_fake)) +
                     self.config.lambda_l1 * self.criterion_L1(fake, y)
@@ -237,7 +315,7 @@ class MRUTrainer:
             with open(config_path, 'w') as fp:
                 json.dump(vars(self.config), fp, indent=2)
 
-        # Save best state when generator loss improves
+        # Save best checkpoint when G loss improves
         if iteration == 1 or loss_G.item() < self.best_loss_G:
             self.best_iter   = iteration
             self.best_loss_G = loss_G.item()
@@ -255,7 +333,7 @@ class MRUTrainer:
             torch.save(self.G.state_dict(), best_checkpoint_G)
             torch.save(self.D.state_dict(), best_checkpoint_D)
 
-            # Save image grid: [sketch | fake | real]
+            # Save grid: sketch | fake | real photo
             grid_cols = []
             for img in images:
                 img = img.detach().cpu().float()
@@ -292,18 +370,19 @@ class MRUTrainer:
 # ===============================
 def args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mixed_precision', type=str,   default='no', choices=['no', 'fp16', 'bf16', 'fp8'], help='Mixed precision training')
-    parser.add_argument('--force_cpu',       action='store_true',                                              help='Force execution on CPU')
-    parser.add_argument('--data_root',       type=str,   default='./data',                                    help='Dataset directory')
-    parser.add_argument('--image_size',      type=int,   default=128,                                         help='Image size')
-    parser.add_argument('--batch_size',      type=int,   default=8,                                           help='Batch size')
-    parser.add_argument('--shuffle',         action='store_true',                                              help='Reshuffle data at every epoch')
-    parser.add_argument('--num_workers',     type=int,   default=0,                                           help='Number of subprocesses for data loading')
-    parser.add_argument('--lr',              type=float, default=2e-4,                                        help='Learning rate')
-    parser.add_argument('--lambda_l1',       type=float, default=100.0,                                       help='L1 loss weight')
-    parser.add_argument('--steps',           type=int,   default=1,                                           help='Number of training steps')
-    parser.add_argument('--output_freq',     type=int,   default=100,                                         help='Log/save frequency (steps)')
-    parser.add_argument('--output_root',     type=str,   default='./output',                                  help='Output directory')
+    parser.add_argument('--mixed_precision', type=str,   default='no',    choices=['no', 'fp16', 'bf16', 'fp8'], help='Mixed precision training')
+    parser.add_argument('--force_cpu',       action='store_true',                                                 help='Force execution on CPU')
+    parser.add_argument('--data_root',       type=str,   default='./data',                                       help='Dataset root (expects photo/ and sketch/ subdirs)')
+    parser.add_argument('--image_size',      type=int,   default=128,                                            help='Image size')
+    parser.add_argument('--batch_size',      type=int,   default=8,                                              help='Batch size')
+    parser.add_argument('--shuffle',         action='store_true',                                                 help='Reshuffle data each epoch')
+    parser.add_argument('--num_workers',     type=int,   default=0,                                              help='DataLoader worker count')
+    parser.add_argument('--lr',              type=float, default=2e-4,                                           help='Learning rate')
+    parser.add_argument('--embed_dim',       type=int,   default=64,                                             help='Class embedding dimension')
+    parser.add_argument('--lambda_l1',       type=float, default=100.0,                                          help='L1 reconstruction loss weight')
+    parser.add_argument('--steps',           type=int,   default=1000,                                              help='Total training steps')
+    parser.add_argument('--output_freq',     type=int,   default=100,                                            help='Log/checkpoint frequency (steps)')
+    parser.add_argument('--output_root',     type=str,   default='./output',                                     help='Output root directory')
     return parser.parse_args()
 
 
