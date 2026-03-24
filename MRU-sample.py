@@ -20,6 +20,25 @@ from transformers import (
 from diffusers import StableDiffusionImg2ImgPipeline
 from controlnet_aux import MidasDetector
 
+import os
+import warnings
+import logging
+
+# Hide HF + transformers logs
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+# Hide diffusers logs
+os.environ["DIFFUSERS_VERBOSITY"] = "error"
+
+# Hide general warnings
+warnings.filterwarnings("ignore")
+
+# Reduce logging level
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("diffusers").setLevel(logging.ERROR)
+logging.getLogger("timm").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR) 
 
 # =========================
 # SKETCH → COMBINED MAP
@@ -57,7 +76,13 @@ def sketch_to_combined_map(sketch, device="cuda"):
 
     seg_image = Image.fromarray(seg_color)
 
-    # COMBINE
+    # force same size
+    target_size = (WIDTH, HEIGHT)
+
+    edge_image = edge_image.resize(target_size)
+    depth_image = depth_image.resize(target_size)
+    seg_image = seg_image.resize(target_size)
+
     edge_np = np.array(edge_image) / 255.0
     depth_np = np.array(depth_image) / 255.0
     seg_np = np.array(seg_image) / 255.0
@@ -96,34 +121,31 @@ def generate_prompt_from_sketch(sketch, device="cuda"):
 # =========================
 # MRU
 # =========================
-def run_mru_on_combined(combined_image, mru_path, device="cuda"):
+def run_mru_on_combined(combined_image, mru_path, class_id, num_classes, device="cuda"):
 
-    class MRU(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.enc = torch.nn.Conv2d(3, 4, 3, padding=1)
-            self.dec = torch.nn.Conv2d(4, 3, 3, padding=1)
+    # ✅ Use SAME model as training
+    model = CondGenerator(num_classes=num_classes, embed_dim=64).to(device)
 
-        def forward(self, x):
-            latent = self.enc(x)
-            refined = self.dec(latent)
-            return refined, latent
-
-    model = MRU().to(device)
+    # ✅ Load trained weights
     model.load_state_dict(torch.load(mru_path, map_location=device))
     model.eval()
 
+    # ✅ Preprocess image
     img = np.array(combined_image).astype(np.float32) / 255.0
     img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
 
+    # ✅ Label input (required)
+    label = torch.tensor([class_id]).to(device)
+
+    # ✅ Inference
     with torch.no_grad():
-        refined, latent = model(img)
+        output = model(img, label)
 
-    refined = refined.squeeze().permute(1, 2, 0).cpu().numpy()
-    refined = (refined * 255).clip(0, 255).astype(np.uint8)
+    # ✅ Postprocess
+    output = output.squeeze().permute(1, 2, 0).cpu().numpy()
+    output = (output * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
 
-    return Image.fromarray(refined)
-
+    return Image.fromarray(output)
 
 # =========================
 # DIFFUSION
@@ -165,6 +187,7 @@ def args():
     parser.add_argument('--prompt', type=str, default=None)
     parser.add_argument('--sketch', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='./output')
+    parser.add_argument('--mru_path', type=str, required=True)
     return parser.parse_args()
 
 
@@ -197,10 +220,13 @@ if __name__ == '__main__':
 
     print("Prompt:", prompt)
 
+    # STEP 3: MRU
+    refined = run_mru_on_combined(combined, config.mru_path)
+
     # -------------------------
-    # STEP 3: DIFFUSION
+    # STEP 4: DIFFUSION
     # -------------------------
-    output = run_diffusion(combined, prompt)
+    output = run_diffusion(refined, prompt)
 
     # -------------------------
     # SAVE OUTPUT
@@ -219,21 +245,3 @@ if __name__ == '__main__':
         json.dump(vars(config), fp, indent=2)
 
     print("Saved:", image_path)
-
-    # -------------------------
-    # SHOW SIDE BY SIDE
-    # -------------------------
-    plt.figure(figsize=(10,5))
-
-    plt.subplot(1,2,1)
-    plt.imshow(sketch)
-    plt.title("Sketch")
-    plt.axis("off")
-
-    plt.subplot(1,2,2)
-    plt.imshow(output)
-    plt.title("Generated Image")
-    plt.axis("off")
-
-    plt.tight_layout()
-    plt.show()
