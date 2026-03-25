@@ -121,29 +121,32 @@ def generate_prompt_from_sketch(sketch, device="cuda"):
 # =========================
 # MRU
 # =========================
-def run_mru_on_combined(combined_image, mru_path, class_id, num_classes, device="cuda"):
+import torch
+import numpy as np
+from PIL import Image
 
-    # ✅ Use SAME model as training
-    model = CondGenerator(num_classes=num_classes, embed_dim=64).to(device)
+def run_mru_on_combined(image, model_path, device="cuda"):
 
-    # ✅ Load trained weights
-    model.load_state_dict(torch.load(mru_path, map_location=device))
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    # ✅ Load FULL generator directly
+    model = torch.load(model_path, map_location=device)
     model.eval()
 
-    # ✅ Preprocess image
-    img = np.array(combined_image).astype(np.float32) / 255.0
-    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
+    # ✅ Preprocess (IMPORTANT: same as training)
+    img = np.array(image).astype(np.float32) / 255.0
+    img = (img - 0.5) / 0.5   # normalize [-1, 1]
 
-    # ✅ Label input (required)
-    label = torch.tensor([class_id]).to(device)
+    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
 
     # ✅ Inference
     with torch.no_grad():
-        output = model(img, label)
+        output = model(img)
 
     # ✅ Postprocess
     output = output.squeeze().permute(1, 2, 0).cpu().numpy()
-    output = (output * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
+    output = (output * 0.5 + 0.5) * 255.0
+    output = output.clip(0, 255).astype(np.uint8)
 
     return Image.fromarray(output)
 
@@ -205,13 +208,15 @@ if __name__ == '__main__':
     # -------------------------
     sketch = Image.open(config.sketch).convert("RGB")
 
+    # STEP 1: MRU
+    refined = run_mru_on_combined(combined, config.mru_path)
     # -------------------------
-    # STEP 1: COMBINED MAP
+    # STEP 2: COMBINED MAP
     # -------------------------
     combined = sketch_to_combined_map(sketch)
 
     # -------------------------
-    # STEP 2: PROMPT
+    # STEP 3: PROMPT
     # -------------------------
     if config.prompt is None:
         prompt = generate_prompt_from_sketch(sketch)
@@ -220,8 +225,6 @@ if __name__ == '__main__':
 
     print("Prompt:", prompt)
 
-    # STEP 3: MRU
-    refined = run_mru_on_combined(combined, config.mru_path)
 
     # -------------------------
     # STEP 4: DIFFUSION
